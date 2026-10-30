@@ -286,9 +286,11 @@ class _TableMetadataUpdateContext:
     def is_added_partition_spec(self, spec_id: int) -> bool:
         return any(update.spec.spec_id == spec_id for update in self._updates if isinstance(update, AddPartitionSpecUpdate))
 
-    def is_added_sort_order(self, sort_order_id: int) -> bool:
-        return any(
-            update.sort_order.order_id == sort_order_id for update in self._updates if isinstance(update, AddSortOrderUpdate)
+    def last_added_sort_order_id(self) -> int | None:
+        """Return the id of the last added sort order, or None if no sort order was added."""
+        return next(
+            (update.sort_order.order_id for update in reversed(self._updates) if isinstance(update, AddSortOrderUpdate)),
+            None,
         )
 
     def has_changes(self) -> bool:
@@ -587,10 +589,15 @@ def _(update: RemoveSnapshotRefUpdate, base_metadata: TableMetadata, context: _T
 
 @_apply_table_update.register(AddSortOrderUpdate)
 def _(update: AddSortOrderUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
+    # Like Java's TableMetadata.Builder.addSortOrder, an update built on stale metadata reuses the id of an equal order
+    # instead of listing it twice, and gets a fresh id when its id is taken by a different order
     for sort in base_metadata.sort_orders:
-        # Only raise in case of a discrepancy
-        if sort.order_id == update.sort_order.order_id and sort != update.sort_order:
-            raise ValueError(f"Sort-order with id {sort.order_id} already exists: {sort}")
+        if sort.fields == update.sort_order.fields:
+            context.add_update(AddSortOrderUpdate(sort_order=sort))
+            return base_metadata
+    if base_metadata.sort_order_by_id(update.sort_order.order_id) is not None:
+        new_order_id = max(sort.order_id for sort in base_metadata.sort_orders) + 1
+        update = AddSortOrderUpdate(sort_order=update.sort_order.model_copy(update={"order_id": new_order_id}))
 
     context.add_update(update)
     return base_metadata.model_copy(
@@ -608,10 +615,11 @@ def _(
 ) -> TableMetadata:
     new_sort_order_id = update.sort_order_id
     if new_sort_order_id == -1:
-        # The last added sort order should be in base_metadata.sort_orders at this point
-        new_sort_order_id = max(sort_order.order_id for sort_order in base_metadata.sort_orders)
-        if not context.is_added_sort_order(new_sort_order_id):
+        # A reused equal order also counts as added, and need not have the highest id
+        last_added_sort_order_id = context.last_added_sort_order_id()
+        if last_added_sort_order_id is None:
             raise ValueError("Cannot set current sort order to the last added one when no sort order has been added")
+        new_sort_order_id = last_added_sort_order_id
 
     if new_sort_order_id == base_metadata.default_sort_order_id:
         return base_metadata
