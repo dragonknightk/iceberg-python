@@ -668,18 +668,8 @@ def test_delete_overwrite_table_with_nan(session_catalog: RestCatalog) -> None:
         schema=arrow_schema,
     )
     """
-    We want to test the _expression_to_complementary_pyarrow function can generate a correct complimentary filter
-    for selecting records to remain in the new overwritten file.
-    Compared with test_delete_overwrite_table_with_null which tests rows with null cells,
-    nan testing is faced with a more tricky issue:
-    A filter of (field == value) will not include cells of nan but col != val will.
-    (Interestingly, neither == or != will include null)
-
-    This means if we set the test case as floats == 2.0 (equal predicate as in test_delete_overwrite_table_with_null),
-    test will pass even without the logic under test
-    in _NullNaNUnmentionedTermsCollector (a helper of _expression_to_complementary_pyarrow
-    to handle revert of iceberg expression of is_null/not_null/is_nan/not_nan).
-    Instead, we test the filter of !=, so that the revert is == which exposes the issue.
+    NaN != 2.0 is true, so a scan with the filter floats != 2.0 returns the NaN row,
+    and the overwrite must delete it together with 1.0, only keeping 2.0.
     """
     tbl.overwrite(arrow_tbl_overwrite, "floats != 2.0")  # Should rewrite one file
 
@@ -693,7 +683,7 @@ def test_delete_overwrite_table_with_nan(session_catalog: RestCatalog) -> None:
 
     from math import isnan
 
-    assert any(isnan(e) for e in result)
+    assert not any(isnan(e) for e in result)
     assert 2.0 in result
     assert 3.0 in result
     assert 4.0 in result

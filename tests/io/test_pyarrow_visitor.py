@@ -29,8 +29,10 @@ from pyiceberg.expressions import (
     BoundReference,
     Not,
     Or,
+    parser,
 )
 from pyiceberg.expressions.literals import literal
+from pyiceberg.expressions.visitors import bind
 from pyiceberg.io.pyarrow import (
     UnsupportedPyArrowTypeException,
     _ConvertToArrowSchema,
@@ -38,7 +40,6 @@ from pyiceberg.io.pyarrow import (
     _ConvertToIcebergWithoutIDs,
     _expression_to_complementary_pyarrow,
     _HasIds,
-    _NullNaNUnmentionedTermsCollector,
     _pyarrow_schema_ensure_large_types,
     _pyarrow_schema_ensure_small_types,
     pyarrow_to_schema,
@@ -783,60 +784,6 @@ def bound_is_null_double_field(bound_reference_double: BoundReference) -> BoundI
     return BoundIsNull(bound_reference_double)
 
 
-def test_collect_null_nan_unmentioned_terms(
-    bound_eq_str_field: BoundEqualTo, bound_is_nan_float_field: BoundIsNaN, bound_is_null_double_field: BoundIsNull
-) -> None:
-    bound_expr = And(
-        Or(And(bound_eq_str_field, bound_is_nan_float_field), bound_is_null_double_field), Not(bound_is_nan_float_field)
-    )
-    collector = _NullNaNUnmentionedTermsCollector()
-    collector.collect(bound_expr)
-    assert {t.ref().field.name for t in collector.null_unmentioned_bound_terms} == {
-        "float_field",
-        "string_field",
-    }
-    assert {t.ref().field.name for t in collector.nan_unmentioned_bound_terms} == {
-        "string_field",
-        "double_field",
-    }
-    assert {t.ref().field.name for t in collector.is_null_or_not_bound_terms} == {
-        "double_field",
-    }
-    assert {t.ref().field.name for t in collector.is_nan_or_not_bound_terms} == {"float_field"}
-
-
-def test_collect_null_nan_unmentioned_terms_with_multiple_predicates_on_the_same_term(
-    bound_eq_str_field: BoundEqualTo,
-    bound_greater_than_float_field: BoundGreaterThan,
-    bound_is_nan_float_field: BoundIsNaN,
-    bound_eq_double_field: BoundEqualTo,
-    bound_is_null_double_field: BoundIsNull,
-) -> None:
-    """Test a single term appears multiple places in the expression tree"""
-    bound_expr = And(
-        Or(
-            And(bound_eq_str_field, bound_greater_than_float_field),
-            And(bound_is_nan_float_field, bound_eq_double_field),
-            bound_greater_than_float_field,
-        ),
-        Not(bound_is_null_double_field),
-    )
-    collector = _NullNaNUnmentionedTermsCollector()
-    collector.collect(bound_expr)
-    assert {t.ref().field.name for t in collector.null_unmentioned_bound_terms} == {
-        "float_field",
-        "string_field",
-    }
-    assert {t.ref().field.name for t in collector.nan_unmentioned_bound_terms} == {
-        "string_field",
-        "double_field",
-    }
-    assert {t.ref().field.name for t in collector.is_null_or_not_bound_terms} == {
-        "double_field",
-    }
-    assert {t.ref().field.name for t in collector.is_nan_or_not_bound_terms} == {"float_field"}
-
-
 def test_expression_to_complementary_pyarrow(
     bound_eq_str_field: BoundEqualTo,
     bound_greater_than_float_field: BoundGreaterThan,
@@ -853,13 +800,47 @@ def test_expression_to_complementary_pyarrow(
         Not(bound_is_null_double_field),
     )
     result = _expression_to_complementary_pyarrow(bound_expr)
-    # Notice an isNan predicate on a str column is automatically converted to always false and removed from Or
-    # and thus will not appear in the pc.expr.
     expected_repr = (
-        '<pyarrow.compute.Expression (((invert(((((string_field == "hello") and (float_field > 100)) '
+        '<pyarrow.compute.Expression coalesce(invert(((((string_field == "hello") and (float_field > 100)) '
         "or ((is_nan(float_field) and (double_field == 0)) or (float_field > 100))) "
-        "and invert(is_null(double_field, {nan_is_null=false})))) "
-        "or is_null(float_field, {nan_is_null=false})) "
-        "or is_null(string_field, {nan_is_null=false})) or is_nan(double_field))>"
+        "and invert(is_null(double_field, {nan_is_null=false})))), true)>"
     )
     assert repr(result) == expected_repr
+
+
+@pytest.mark.parametrize(
+    "row_filter, expected_kept",
+    [
+        # The filter is from https://github.com/apache/iceberg-python/issues/4184, where x=2 is expected to remain.
+        # x=4 has p null, so the filter evaluates to null for it and it is not matched by a scan either.
+        ("(p == 1 AND v IS NULL) OR (p == 2 AND v == 'c')", [2, 4]),
+        # Also from the issue: x=1 matches p == 1 although v is null, x=2 evaluates to null and is kept.
+        ("p == 1 OR v == 'c'", [2]),
+        # NaN != 2.0 is true when scanning, so x=2 is deleted; x=4 (null) is kept since null != 2.0 is null.
+        ("f != 2.0", [3, 4]),
+        # NaN is not null, so only x=4 (null) is kept.
+        ("f IS NOT NULL", [4]),
+        # A nested field, so the schema has to be passed to expression_to_pyarrow for the field reference.
+        ("s.a == 1 OR v == 'c'", [2]),
+    ],
+)
+def test_expression_to_complementary_pyarrow_keeps_rows_not_matching(row_filter: str, expected_kept: list[int]) -> None:
+    schema = Schema(
+        NestedField(1, "x", LongType(), required=True),
+        NestedField(2, "p", LongType(), required=False),
+        NestedField(3, "v", StringType(), required=False),
+        NestedField(4, "f", DoubleType(), required=False),
+        NestedField(5, "s", StructType(NestedField(6, "a", LongType(), required=False)), required=False),
+    )
+    table = pa.table(
+        {
+            "x": pa.array([1, 2, 3, 4], pa.int64()),
+            "p": pa.array([1, 2, 2, None], pa.int64()),
+            "v": pa.array([None, None, "c", "c"], pa.string()),
+            "f": pa.array([1.0, float("nan"), 2.0, None], pa.float64()),
+            "s": pa.array([{"a": 1}, {"a": None}, None, {"a": 2}], pa.struct([("a", pa.int64())])),
+        }
+    )
+    bound_expr = bind(schema, parser.parse(row_filter), case_sensitive=True)
+    kept = table.filter(_expression_to_complementary_pyarrow(bound_expr, schema))["x"].to_pylist()
+    assert kept == expected_kept
