@@ -19,8 +19,11 @@ from __future__ import annotations
 
 import base64
 import os
+import time
+import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import timedelta
 from typing import Any, cast
 from unittest import mock
 from urllib.parse import parse_qs, quote, urlsplit
@@ -37,24 +40,31 @@ from pyiceberg.catalog import PropertiesUpdateSummary, load_catalog
 from pyiceberg.catalog.rest import (
     DEFAULT_ENDPOINTS,
     EMPTY_BODY_SHA256,
+    IDEMPOTENCY_KEY_HEADER,
     OAUTH2_SERVER_URI,
     PAGE_SIZE,
     REST_CLIENT_CONNECTION_TIMEOUT_MS,
     REST_CLIENT_MAX_RETRIES,
     REST_CLIENT_RETRY_BACKOFF_FACTOR,
     REST_CLIENT_SOCKET_TIMEOUT_MS,
+    REST_IDEMPOTENCY_KEY_LIFETIME,
     SIGV4_MAX_RETRIES,
     SIGV4_MAX_RETRIES_DEFAULT,
     SNAPSHOT_LOADING_MODE,
     Capability,
+    ConfigResponse,
     Endpoint,
     HttpMethod,
     RestCatalog,
     ScanPlanningMode,
+    _IdempotencyAwareRetry,
     _RetryTimeoutHTTPAdapter,
+    generate_uuid_v7,
+    parse_key_lifetime,
 )
 from pyiceberg.exceptions import (
     AuthorizationExpiredError,
+    BadRequestError,
     NamespaceAlreadyExistsError,
     NamespaceNotEmptyError,
     NoSuchIdentifierError,
@@ -2576,6 +2586,311 @@ def test_session_with_invalid_connection_retries_raises(rest_mock: Mocker) -> No
     }
     with pytest.raises(ValueError, match="`rest.client.max-retries` must be non-negative"):
         RestCatalog("rest", **catalog_properties)
+
+
+def test_parse_key_lifetime_boundaries() -> None:
+    """Issue #4290 / OpenAPI idempotency-key-lifetime; mirrors Java HTTPClient.parseKeyLifetime."""
+    assert parse_key_lifetime(None) is None
+    assert parse_key_lifetime("PT30M") == timedelta(minutes=30)
+    assert parse_key_lifetime("PT24H") == timedelta(hours=24)
+    assert parse_key_lifetime("PT0S") == timedelta(0)
+    assert parse_key_lifetime("PT-5M") == timedelta(0)
+    assert parse_key_lifetime("-PT5M") == timedelta(0)
+    assert parse_key_lifetime("not-a-duration") is None
+
+
+def test_config_response_rejects_invalid_idempotency_lifetime() -> None:
+    """Issue #4290 / OpenAPI: invalid idempotency-key-lifetime is rejected at config parse time."""
+    with pytest.raises(ValidationError):
+        ConfigResponse.model_validate({"defaults": {}, "overrides": {}, "idempotency-key-lifetime": "not-a-duration"})
+    with pytest.raises(ValidationError):
+        ConfigResponse.model_validate({"defaults": {}, "overrides": {}, "idempotency-key-lifetime": ""})
+
+
+def test_generate_uuid_v7_is_version_7() -> None:
+    """Issue #4290 / OpenAPI Idempotency-Key: keys are RFC 9562 UUIDv7 (Java UUIDUtil.generateUuidV7)."""
+    before_ms = int(time.time() * 1000)
+    value = generate_uuid_v7()
+    after_ms = int(time.time() * 1000)
+    assert isinstance(value, uuid.UUID)
+    assert value.version == 7
+    assert value.variant == uuid.RFC_4122
+    timestamp_ms = value.int >> 80
+    assert before_ms <= timestamp_ms <= after_ms
+
+
+def test_client_sends_idempotency_key_when_server_advertises(requests_mock: Mocker) -> None:
+    """Issue #4290: when config advertises idempotency-key-lifetime, mutations send Idempotency-Key; reads do not."""
+    requests_mock.get(
+        f"{TEST_URI}v1/config",
+        json={
+            "defaults": {},
+            "overrides": {},
+            "endpoints": [str(endpoint) for endpoint in TEST_SUPPORTED_ENDPOINTS],
+            "idempotency-key-lifetime": "PT30M",
+        },
+        status_code=200,
+    )
+    namespace = "idem"
+    create_mock = requests_mock.post(
+        f"{TEST_URI}v1/namespaces",
+        json={"namespace": [namespace], "properties": {}},
+        status_code=200,
+    )
+    list_mock = requests_mock.get(
+        f"{TEST_URI}v1/namespaces",
+        json={"namespaces": [[namespace]]},
+        status_code=200,
+    )
+
+    catalog = RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN)
+    assert catalog._idempotency_enabled is True
+    assert catalog.properties[REST_IDEMPOTENCY_KEY_LIFETIME] == "PT30M"
+    assert isinstance(catalog._session.adapters["https://"], _RetryTimeoutHTTPAdapter)
+    assert isinstance(catalog._session.adapters["https://"].max_retries, _IdempotencyAwareRetry)
+
+    catalog.create_namespace(namespace)
+    # Assert the literal header name so a renamed constant cannot hide a wire-format break.
+    assert "Idempotency-Key" in create_mock.last_request.headers
+    key = create_mock.last_request.headers["Idempotency-Key"]
+    assert key == create_mock.last_request.headers.get(IDEMPOTENCY_KEY_HEADER)
+    assert uuid.UUID(key)
+
+    catalog.list_namespaces()
+    assert "Idempotency-Key" not in list_mock.last_request.headers
+
+
+def test_client_does_not_send_idempotency_key_when_not_advertised(rest_mock: Mocker) -> None:
+    """Issue #4290: without idempotency-key-lifetime in config, mutations omit Idempotency-Key."""
+    namespace = "no-idem"
+    create_mock = rest_mock.post(
+        f"{TEST_URI}v1/namespaces",
+        json={"namespace": [namespace], "properties": {}},
+        status_code=200,
+    )
+    catalog = RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN)
+    assert catalog._idempotency_enabled is False
+    catalog.create_namespace(namespace)
+    assert "Idempotency-Key" not in create_mock.last_request.headers
+
+
+def test_idempotency_positive_lifetime_cutoff_skips_retry() -> None:
+    """Issue #4290 / Java keyed retry: when elapsed + next backoff reaches the lifetime, do not retry."""
+    retry = _IdempotencyAwareRetry(
+        total=3,
+        backoff_factor=0.0,
+        status_forcelist=[408, 429, 500, 502, 503, 504],
+        allowed_methods=frozenset({"POST"}),
+        raise_on_status=False,
+        key_lifetime=timedelta(seconds=5),
+        _keyed=True,
+        # First attempt was long enough ago that the window is already exhausted.
+        _first_attempt_mono=time.monotonic() - 10.0,
+    )
+    assert retry.is_retry("POST", 503) is False
+
+    within_window = _IdempotencyAwareRetry(
+        total=3,
+        backoff_factor=0.0,
+        status_forcelist=[408, 429, 500, 502, 503, 504],
+        allowed_methods=frozenset({"POST"}),
+        raise_on_status=False,
+        key_lifetime=timedelta(minutes=30),
+        _keyed=True,
+        _first_attempt_mono=time.monotonic(),
+    )
+    assert within_window.is_retry("POST", 503) is True
+
+
+def test_commit_table_does_not_leak_idempotency_key_into_session(
+    requests_mock: Mocker, example_table_metadata_v2: dict[str, Any]
+) -> None:
+    """Issue #4290: commit_table must not leave Idempotency-Key on session.headers for later GETs."""
+    requests_mock.get(
+        f"{TEST_URI}v1/config",
+        json={
+            "defaults": {},
+            "overrides": {},
+            "endpoints": [str(endpoint) for endpoint in TEST_SUPPORTED_ENDPOINTS],
+            "idempotency-key-lifetime": "PT30M",
+        },
+        status_code=200,
+    )
+    metadata_location = "s3://some_bucket/metadata.json"
+    commit_mock = requests_mock.post(
+        url=f"{TEST_URI}v1/namespaces/namespace/tables/table_name",
+        json={"metadata": example_table_metadata_v2, "metadata-location": metadata_location},
+        status_code=200,
+    )
+    list_mock = requests_mock.get(
+        f"{TEST_URI}v1/namespaces",
+        json={"namespaces": [["namespace"]]},
+        status_code=200,
+    )
+
+    catalog = RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN)
+    table = Table(
+        identifier=("namespace", "table_name"),
+        metadata=None,  # type: ignore
+        metadata_location=metadata_location,
+        io=None,  # type: ignore
+        catalog=catalog,
+    )
+    catalog.commit_table(table, (), ())
+    assert "Idempotency-Key" in commit_mock.last_request.headers
+    assert "Idempotency-Key" not in catalog._session.headers
+
+    catalog.list_namespaces()
+    assert "Idempotency-Key" not in list_mock.last_request.headers
+    assert "Idempotency-Key" not in catalog._session.headers
+
+
+@contextmanager
+def _local_rest_server_create_namespace_status_then_200(
+    num_failures: int,
+    *,
+    failure_status: int = 503,
+    idempotency_lifetime: str | None = "PT30M",
+) -> Iterator[dict[str, Any]]:
+    """Loopback server that fails createNamespace then succeeds; records Idempotency-Key values.
+
+    Used for issue #4290 keyed-retry coverage (OpenAPI Idempotency-Key / Java keyed POST retries).
+    """
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    state: dict[str, Any] = {"create_calls": 0, "keys": [], "statuses": []}
+    config: dict[str, Any] = {
+        "defaults": {},
+        "overrides": {},
+        "endpoints": [str(endpoint) for endpoint in TEST_SUPPORTED_ENDPOINTS],
+    }
+    if idempotency_lifetime is not None:
+        config["idempotency-key-lifetime"] = idempotency_lifetime
+    config_body = json.dumps(config).encode()
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path.endswith("/v1/config"):
+                self._respond(200, config_body)
+            else:
+                self._respond(404, b"")
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length:
+                self.rfile.read(length)
+            if self.path.endswith("/v1/namespaces"):
+                state["create_calls"] += 1
+                key = self.headers.get("Idempotency-Key")
+                if key is not None:
+                    state["keys"].append(key)
+                if state["create_calls"] <= num_failures:
+                    state["statuses"].append(failure_status)
+                    self._respond(failure_status, b"")
+                else:
+                    state["statuses"].append(200)
+                    self._respond(200, json.dumps({"namespace": ["foo"], "properties": {}}).encode())
+            else:
+                self._respond(404, b"")
+
+        def _respond(self, status: int, body: bytes) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    state["port"] = server.server_address[1]
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_idempotency_key_reused_across_retries_on_503() -> None:
+    """Issue #4290 / Java keyed retry: 503 then 200 reuses the same Idempotency-Key across attempts."""
+    with _local_rest_server_create_namespace_status_then_200(num_failures=1, failure_status=503) as server:
+        catalog = RestCatalog(
+            "rest",
+            **{
+                "uri": f"http://127.0.0.1:{server['port']}/",
+                "token": TEST_TOKEN,
+                # Explicit retries keep the test deterministic; lifetime alone also enables retries.
+                REST_CLIENT_MAX_RETRIES: "3",
+                REST_CLIENT_RETRY_BACKOFF_FACTOR: "0",
+            },
+        )
+        catalog.create_namespace("foo")
+        assert server["create_calls"] == 2
+        assert len(server["keys"]) == 2
+        assert server["keys"][0] == server["keys"][1]
+
+
+def test_idempotency_keyed_post_retries_on_408() -> None:
+    """Issue #4290 / Java keyed retry: a keyed POST retries on 408 Request Timeout."""
+    with _local_rest_server_create_namespace_status_then_200(num_failures=1, failure_status=408) as server:
+        catalog = RestCatalog(
+            "rest",
+            **{
+                "uri": f"http://127.0.0.1:{server['port']}/",
+                "token": TEST_TOKEN,
+                REST_CLIENT_MAX_RETRIES: "3",
+                REST_CLIENT_RETRY_BACKOFF_FACTOR: "0",
+            },
+        )
+        catalog.create_namespace("foo")
+        assert server["create_calls"] == 2
+        assert server["statuses"] == [408, 200]
+        assert server["keys"][0] == server["keys"][1]
+
+
+def test_idempotency_keyed_post_does_not_retry_on_400() -> None:
+    """Issue #4290: a keyed POST must not retry on non-retriable 400 Bad Request."""
+    with _local_rest_server_create_namespace_status_then_200(num_failures=100, failure_status=400) as server:
+        catalog = RestCatalog(
+            "rest",
+            **{
+                "uri": f"http://127.0.0.1:{server['port']}/",
+                "token": TEST_TOKEN,
+                REST_CLIENT_MAX_RETRIES: "3",
+                REST_CLIENT_RETRY_BACKOFF_FACTOR: "0",
+            },
+        )
+        with pytest.raises(BadRequestError):
+            catalog.create_namespace("foo")
+        assert server["create_calls"] == 1
+        assert server["statuses"] == [400]
+
+
+def test_idempotency_zero_lifetime_does_not_retry_keyed_post() -> None:
+    """Issue #4290 / Java parseKeyLifetime: PT0S is a zero reuse window, so keyed mutations are not retried."""
+    with _local_rest_server_create_namespace_status_then_200(
+        num_failures=100, failure_status=503, idempotency_lifetime="PT0S"
+    ) as server:
+        catalog = RestCatalog(
+            "rest",
+            **{
+                "uri": f"http://127.0.0.1:{server['port']}/",
+                "token": TEST_TOKEN,
+                REST_CLIENT_MAX_RETRIES: "3",
+                REST_CLIENT_RETRY_BACKOFF_FACTOR: "0",
+            },
+        )
+        with pytest.raises(ServiceUnavailableError):
+            catalog.create_namespace("foo")
+        # Zero lifetime forbids retries, so only the initial attempt runs.
+        assert server["create_calls"] == 1
+        assert len(server["keys"]) == 1
 
 
 def test_rest_catalog_with_basic_auth_type(rest_mock: Mocker) -> None:

@@ -17,13 +17,18 @@
 from __future__ import annotations
 
 import logging
+import re
+import secrets
 import time
+import uuid
 from collections import deque
 from collections.abc import Mapping
+from datetime import timedelta
 from enum import Enum, StrEnum
 from typing import (
     TYPE_CHECKING,
     Any,
+    Self,
 )
 from urllib.parse import quote, unquote
 
@@ -294,10 +299,21 @@ REST_CLIENT_CONNECTION_TIMEOUT_MS = "rest.client.connection-timeout-ms"
 REST_CLIENT_SOCKET_TIMEOUT_MS = "rest.client.socket-timeout-ms"
 REST_CLIENT_MAX_RETRIES = "rest.client.max-retries"
 REST_CLIENT_RETRY_BACKOFF_FACTOR = "rest.client.retry-backoff-factor"
+# Server-advertised Idempotency-Key reuse window (ISO-8601 duration). Presence enables
+# sending Idempotency-Key on mutations; mirrors Java HTTPClient.REST_IDEMPOTENCY_KEY_LIFETIME.
+REST_IDEMPOTENCY_KEY_LIFETIME = "rest.client.idempotency-key-lifetime"
+IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+# Default max retries when the server advertises idempotency but the client did not set
+# rest.client.max-retries. Matches Java HTTPClient's rest.client.max-retries default of 5.
+_IDEMPOTENCY_DEFAULT_MAX_RETRIES = 5
 # Hard-coded internally so users cannot misconfigure the retry policy
 # (e.g. setting raise_on_status=False would swallow 4xx errors silently).
 _CONNECTION_RETRY_STATUS_FORCELIST = (429, 500, 502, 503, 504)
 _CONNECTION_RETRY_ALLOWED_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
+# Retriable codes for requests that carry an Idempotency-Key (aligned with Java's
+# ExponentialHttpRequestRetryStrategy idempotentRetriableCodes, including 408).
+_KEYED_RETRY_STATUS_FORCELIST = (408, 429, 500, 502, 503, 504)
+_KEYED_RETRY_ALLOWED_METHODS = _CONNECTION_RETRY_ALLOWED_METHODS | frozenset({"POST"})
 EMPTY_BODY_SHA256: str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 OAUTH2_SERVER_URI = "oauth2-server-uri"
 SNAPSHOT_LOADING_MODE = "snapshot-loading-mode"
@@ -320,6 +336,93 @@ PAGE_SIZE = "rest-page-size"
 
 NAMESPACE_SEPARATOR_PROPERTY = "namespace-separator"
 DEFAULT_NAMESPACE_SEPARATOR = b"\x1f".decode(UTF8)
+
+
+# ISO-8601 duration as accepted by java.time.Duration.parse (no years/months).
+_ISO8601_DURATION_RE = re.compile(
+    r"^(?P<sign>[-+]?)P"
+    r"(?:(?P<days>[-+]?\d+)D)?"
+    r"(?:T"
+    r"(?:(?P<hours>[-+]?\d+)H)?"
+    r"(?:(?P<minutes>[-+]?\d+)M)?"
+    r"(?:(?P<seconds>[-+]?\d+)(?:[.,](?P<fraction>\d{1,9}))?S)?"
+    r")?$"
+)
+
+
+def _parse_iso8601_duration(value: str) -> timedelta:
+    """Parse an ISO-8601 duration string the way ``java.time.Duration.parse`` does.
+
+    Supports forms such as ``PT30M``, ``PT24H``, ``P1DT2H``, ``PT-5M``, and ``-PT5M``.
+    Years and months are rejected because they are not fixed-length in ``Duration``.
+    """
+    match = _ISO8601_DURATION_RE.match(value)
+    if not match or not any(match.group(name) for name in ("days", "hours", "minutes", "seconds")):
+        raise ValueError(f"Invalid ISO-8601 duration: {value!r}")
+
+    sign = -1 if match.group("sign") == "-" else 1
+    days = int(match.group("days") or 0)
+    hours = int(match.group("hours") or 0)
+    minutes = int(match.group("minutes") or 0)
+    seconds = int(match.group("seconds") or 0)
+    fraction = match.group("fraction")
+    micros = 0
+    if fraction is not None:
+        # Pad/truncate to microsecond precision (6 digits), matching timedelta resolution.
+        micros = int((fraction + "000000")[:6])
+        if seconds < 0 or (seconds == 0 and (match.group("seconds") or "").startswith("-")):
+            micros = -micros
+
+    delta = timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds, microseconds=micros)
+    return sign * delta
+
+
+def parse_key_lifetime(lifetime: str | None) -> timedelta | None:
+    """Parse a server-advertised idempotency-key lifetime, matching Java ``HTTPClient.parseKeyLifetime``.
+
+    Returns:
+        ``None`` when unset, malformed, or out of range (lifetime bound disabled).
+        ``timedelta(0)`` for a non-positive window (keyed retries never fire).
+        Otherwise the positive reuse window.
+    """
+    if lifetime is None:
+        return None
+    try:
+        parsed = _parse_iso8601_duration(lifetime)
+    except ValueError:
+        logger.warning("Ignoring malformed idempotency-key lifetime: %s", lifetime)
+        return None
+
+    if parsed <= timedelta(0):
+        # Non-positive window: never retry keyed requests (None would instead disable the bound).
+        return timedelta(0)
+
+    max_seconds = timedelta.max.total_seconds()
+    if parsed.total_seconds() > max_seconds:
+        logger.warning("Ignoring out-of-range idempotency-key lifetime: %s", lifetime)
+        return None
+    return parsed
+
+
+def generate_uuid_v7() -> uuid.UUID:
+    """Generate an RFC 9562 UUIDv7, matching Java ``UUIDUtil.generateUuidV7``.
+
+    Layout: 48-bit Unix epoch milliseconds, 4-bit version (7), 12-bit random, 2-bit variant, 62-bit random.
+    """
+    epoch_ms = int(time.time() * 1000)
+    if epoch_ms >> 48:
+        raise ValueError(f"Invalid timestamp: does not fit within 48 bits: {epoch_ms}")
+
+    rand_a = secrets.randbits(12)
+    rand_b = secrets.randbits(62)
+    msb = (epoch_ms << 16) | 0x7000 | rand_a
+    lsb = 0x8000000000000000 | rand_b
+    return uuid.UUID(int=((msb & 0xFFFFFFFFFFFFFFFF) << 64) | (lsb & 0xFFFFFFFFFFFFFFFF))
+
+
+def idempotency_headers() -> dict[str, str]:
+    """Return a single-use headers map containing a freshly generated Idempotency-Key (UUIDv7)."""
+    return {IDEMPOTENCY_KEY_HEADER: str(generate_uuid_v7())}
 
 
 def _parse_scan_planning_mode(properties: Properties, *, strict: bool = True) -> ScanPlanningMode | None:
@@ -421,6 +524,7 @@ class ConfigResponse(IcebergBaseModel):
     defaults: Properties | None = Field(default_factory=dict)
     overrides: Properties | None = Field(default_factory=dict)
     endpoints: set[Endpoint] | None = Field(default=None)
+    idempotency_key_lifetime: str | None = Field(alias="idempotency-key-lifetime", default=None)
 
     @field_validator("endpoints", mode="before")
     @classmethod
@@ -428,6 +532,15 @@ class ConfigResponse(IcebergBaseModel):
         if v is None:
             return None
         return {Endpoint.from_string(s) for s in v}
+
+    @field_validator("idempotency_key_lifetime")
+    @classmethod
+    def _validate_idempotency_key_lifetime(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        # Reject malformed values at config-parse time, matching Java ConfigResponseParser.
+        _parse_iso8601_duration(v)
+        return v
 
 
 class ListNamespaceResponse(IcebergBaseModel):
@@ -476,12 +589,51 @@ class ListViewsResponse(IcebergBaseModel):
 _PLANNING_RESPONSE_ADAPTER = TypeAdapter(PlanningResponse)
 
 
+class _IdempotencyAwareRetry(Retry):
+    """urllib3 Retry that can expand POST retries for Idempotency-Key requests and bound them by lifetime."""
+
+    def __init__(
+        self,
+        *args: Any,
+        key_lifetime: timedelta | None = None,
+        _keyed: bool = False,
+        _first_attempt_mono: float | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self.key_lifetime = key_lifetime
+        self._keyed = _keyed
+        self._first_attempt_mono = _first_attempt_mono
+        super().__init__(*args, **kwargs)
+
+    def new(self, **kw: Any) -> Self:
+        # Propagate idempotency fields; callers may override via kw (e.g. adapter.send).
+        kw.setdefault("key_lifetime", self.key_lifetime)
+        kw.setdefault("_keyed", self._keyed)
+        kw.setdefault("_first_attempt_mono", self._first_attempt_mono)
+        return super().new(**kw)
+
+    def is_retry(self, method: str, status_code: int, has_retry_after: bool = False) -> bool:
+        if not super().is_retry(method, status_code, has_retry_after):
+            return False
+        if self._keyed and self.key_lifetime is not None and self._first_attempt_mono is not None:
+            # Match Java: decline when elapsed + next interval would reach the lifetime window.
+            elapsed = time.monotonic() - self._first_attempt_mono
+            next_interval = self.get_backoff_time() or 0.0
+            if elapsed + next_interval >= self.key_lifetime.total_seconds():
+                return False
+        return True
+
+
 class _RetryTimeoutHTTPAdapter(HTTPAdapter):
     """HTTPAdapter that applies a default per-request timeout.
 
     requests does not provide a way to set a default timeout on a Session;
     without this adapter, every call would have to thread `timeout=` through.
     The adapter applies `self._timeout` whenever a per-call timeout is not set.
+
+    When a request carries an Idempotency-Key, the adapter temporarily expands the retry
+    policy so POSTs are retried on retriable 5xx/408/429, and bounds retries by the
+    server-advertised key lifetime (see ``_IdempotencyAwareRetry``).
     """
 
     def __init__(self, timeout: float | None = None, max_retries: Retry | int = DEFAULT_RETRIES) -> None:
@@ -499,13 +651,30 @@ class _RetryTimeoutHTTPAdapter(HTTPAdapter):
     ) -> Response:
         if timeout is None:
             timeout = self._timeout
-        return super().send(request, stream=stream, timeout=timeout, verify=verify, cert=cert, proxies=proxies)
+
+        original_retries = self.max_retries
+        try:
+            if isinstance(original_retries, _IdempotencyAwareRetry) and request.headers.get(IDEMPOTENCY_KEY_HEADER):
+                # Per-request clone: allow POST and honor the key lifetime window.
+                self.max_retries = original_retries.new(
+                    allowed_methods=_KEYED_RETRY_ALLOWED_METHODS,
+                    status_forcelist=list(_KEYED_RETRY_STATUS_FORCELIST),
+                    _keyed=True,
+                    _first_attempt_mono=time.monotonic(),
+                )
+            return super().send(request, stream=stream, timeout=timeout, verify=verify, cert=cert, proxies=proxies)
+        finally:
+            self.max_retries = original_retries
 
 
 def _create_connection_adapter(properties: Properties) -> _RetryTimeoutHTTPAdapter | None:
     """Build a connection adapter from the optional `rest.client.*` properties.
 
-    Returns None when no connection properties are supplied, leaving the default
+    Also mounts when the server advertised ``idempotency-key-lifetime`` (stored as
+    ``rest.client.idempotency-key-lifetime``), so keyed mutation POSTs can be retried.
+    When only the lifetime is set, non-keyed requests keep the previous no-retry default.
+
+    Returns None when no connection/idempotency properties are supplied, leaving the default
     Session behavior unchanged. Raises ValueError on invalid input.
     """
     connection_timeout_ms = property_as_int(properties, REST_CLIENT_CONNECTION_TIMEOUT_MS)
@@ -524,7 +693,12 @@ def _create_connection_adapter(properties: Properties) -> _RetryTimeoutHTTPAdapt
     if backoff_factor is not None and backoff_factor < 0:
         raise ValueError(f"`{REST_CLIENT_RETRY_BACKOFF_FACTOR}` must be non-negative, got: {backoff_factor}")
 
-    if all(value is None for value in (connection_timeout_ms, socket_timeout_ms, retries, backoff_factor)):
+    lifetime_str = properties.get(REST_IDEMPOTENCY_KEY_LIFETIME)
+    key_lifetime = parse_key_lifetime(lifetime_str)
+
+    has_timeout = connection_timeout_ms is not None or socket_timeout_ms is not None
+    has_retry_config = retries is not None or backoff_factor is not None
+    if not has_timeout and not has_retry_config and lifetime_str is None:
         return None
 
     # requests uses a single timeout and cannot split connect vs socket, so follow the Java client
@@ -533,20 +707,39 @@ def _create_connection_adapter(properties: Properties) -> _RetryTimeoutHTTPAdapt
     if connection_timeout_ms is not None or socket_timeout_ms is not None:
         timeout = ((connection_timeout_ms or 0) + (socket_timeout_ms or 0)) // 1000
 
+    if retries is not None:
+        total_retries: int = retries
+    elif lifetime_str is not None:
+        # Server advertised idempotency; enable keyed POST retries with Java's default of 5.
+        total_retries = _IDEMPOTENCY_DEFAULT_MAX_RETRIES
+    else:
+        # Timeout-only: keep the historical no-op Retry (total=0).
+        total_retries = DEFAULT_RETRIES
+
+    # Lifetime-only: do not start retrying reads/GETs that previously had no adapter.
+    # Explicit rest.client.* retry config keeps the existing idempotent-method allowlist.
+    # Use a non-empty sentinel so urllib3 does not treat an empty frozenset as "all methods"
+    # (empty is falsy in `_is_method_retryable`). Keyed requests expand the allowlist in send().
+    if has_retry_config or has_timeout:
+        allowed_methods: frozenset[str] = _CONNECTION_RETRY_ALLOWED_METHODS
+    else:
+        allowed_methods = frozenset({"__NO_UNKEYED_RETRY__"})
+
     return _RetryTimeoutHTTPAdapter(
         timeout=timeout,
-        max_retries=Retry(
+        max_retries=_IdempotencyAwareRetry(
             # `retries` and `backoff_factor` fall back to a no-op Retry when unset, so a user can
             # configure only one without having to specify the rest of the policy.
-            total=retries if retries is not None else DEFAULT_RETRIES,
+            total=total_retries,
             backoff_factor=backoff_factor if backoff_factor is not None else 0.0,
             status_forcelist=list(_CONNECTION_RETRY_STATUS_FORCELIST),
-            allowed_methods=_CONNECTION_RETRY_ALLOWED_METHODS,
+            allowed_methods=allowed_methods,
             # Return the final response on retry exhaustion (instead of raising MaxRetryError)
             # so `_handle_non_200_response` can map the 5xx status to a typed exception
             # (ServiceUnavailableError, etc.). 4xx codes are not in status_forcelist and are
             # never retried, so they reach the same mapping unchanged.
             raise_on_status=False,
+            key_lifetime=key_lifetime,
         ),
     )
 
@@ -557,6 +750,7 @@ class RestCatalog(Catalog):
     _auth_manager: AuthManager | None
     _supported_endpoints: set[Endpoint]
     _namespace_separator: str
+    _idempotency_enabled: bool
 
     def __init__(self, name: str, **properties: str):
         """Rest Catalog.
@@ -569,6 +763,7 @@ class RestCatalog(Catalog):
         """
         super().__init__(name, **properties)
         self._auth_manager: AuthManager | None = None
+        self._idempotency_enabled = False
         self.uri = properties[URI]
         self._fetch_config()
         self._session = self._create_session()
@@ -1049,6 +1244,13 @@ class RestCatalog(Catalog):
         config.update(config_response.overrides)
         self.properties = config
 
+        # Enable Idempotency-Key on mutations only when the server advertises support.
+        if config_response.idempotency_key_lifetime is not None:
+            self._idempotency_enabled = True
+            self.properties[REST_IDEMPOTENCY_KEY_LIFETIME] = config_response.idempotency_key_lifetime
+        else:
+            self._idempotency_enabled = False
+
         # Update URI based on overrides
         self.uri = config[URI]
 
@@ -1201,6 +1403,16 @@ class RestCatalog(Catalog):
         if isinstance(auth_manager, LegacyOAuth2AuthManager):
             auth_manager._refresh_token()
 
+    def _mutation_headers(self) -> dict[str, str]:
+        """Headers for mutating REST calls when the server advertised idempotency support.
+
+        Returns a fresh UUIDv7 Idempotency-Key for each logical operation. Retries of the same
+        HTTP request reuse the key because urllib3 retries the same PreparedRequest.
+        """
+        if not self._idempotency_enabled:
+            return {}
+        return idempotency_headers()
+
     def _config_headers(self, session: Session) -> None:
         header_properties = get_header_properties(self.properties)
         session.headers.update(header_properties)
@@ -1244,6 +1456,7 @@ class RestCatalog(Catalog):
         response = self._session.post(
             self.url(Endpoints.create_table, namespace=namespace_and_table["namespace"]),
             data=serialized_json,
+            headers=self._mutation_headers(),
         )
         try:
             response.raise_for_status()
@@ -1326,6 +1539,7 @@ class RestCatalog(Catalog):
         response = self._session.post(
             self.url(Endpoints.create_view, namespace=namespace_and_view["namespace"]),
             data=serialized_json,
+            headers=self._mutation_headers(),
         )
 
         try:
@@ -1363,6 +1577,7 @@ class RestCatalog(Catalog):
         response = self._session.post(
             self.url(Endpoints.register_table, namespace=namespace_and_table["namespace"]),
             data=serialized_json,
+            headers=self._mutation_headers(),
         )
         try:
             response.raise_for_status()
@@ -1389,6 +1604,7 @@ class RestCatalog(Catalog):
         namespace_and_table = self._split_identifier_for_path(identifier)
         response = self._session.post(
             self.url(Endpoints.unregister_table, prefixed=True, **namespace_and_table),
+            headers=self._mutation_headers(),
         )
         try:
             response.raise_for_status()
@@ -1489,6 +1705,7 @@ class RestCatalog(Catalog):
         response = self._session.delete(
             self.url(Endpoints.drop_table, prefixed=True, **self._split_identifier_for_path(identifier)),
             params={"purgeRequested": purge_requested},
+            headers=self._mutation_headers(),
         )
         try:
             response.raise_for_status()
@@ -1518,7 +1735,7 @@ class RestCatalog(Catalog):
         if not self.namespace_exists(destination_namespace):
             raise NoSuchNamespaceError(f"Destination namespace does not exist: {destination_namespace}")
 
-        response = self._session.post(self.url(Endpoints.rename_table), json=payload)
+        response = self._session.post(self.url(Endpoints.rename_table), json=payload, headers=self._mutation_headers())
         try:
             response.raise_for_status()
         except HTTPError as exc:
@@ -1615,7 +1832,8 @@ class RestCatalog(Catalog):
         table_identifier = TableIdentifier(namespace=identifier[:-1], name=identifier[-1])
         table_request = CommitTableRequest(identifier=table_identifier, requirements=requirements, updates=updates)
 
-        headers = self._session.headers
+        headers = dict(self._session.headers)
+        headers.update(self._mutation_headers())
         if table_token := table.config.get(TOKEN):
             headers[AUTHORIZATION_HEADER] = f"{BEARER_PREFIX} {table_token}"
 
@@ -1644,7 +1862,7 @@ class RestCatalog(Catalog):
         self._check_endpoint(Capability.V1_CREATE_NAMESPACE)
         namespace_tuple = self._check_valid_namespace_identifier(namespace)
         payload = {"namespace": namespace_tuple, "properties": properties}
-        response = self._session.post(self.url(Endpoints.create_namespace), json=payload)
+        response = self._session.post(self.url(Endpoints.create_namespace), json=payload, headers=self._mutation_headers())
         try:
             response.raise_for_status()
         except HTTPError as exc:
@@ -1656,7 +1874,7 @@ class RestCatalog(Catalog):
         self._check_endpoint(Capability.V1_DELETE_NAMESPACE)
         namespace_tuple = self._check_valid_namespace_identifier(namespace)
         namespace = self._encode_namespace_path(namespace_tuple)
-        response = self._session.delete(self.url(Endpoints.drop_namespace, namespace=namespace))
+        response = self._session.delete(self.url(Endpoints.drop_namespace, namespace=namespace), headers=self._mutation_headers())
         try:
             response.raise_for_status()
         except HTTPError as exc:
@@ -1723,7 +1941,11 @@ class RestCatalog(Catalog):
         namespace_tuple = self._check_valid_namespace_identifier(namespace)
         namespace = self._encode_namespace_path(namespace_tuple)
         payload = {"removals": list(removals or []), "updates": updates}
-        response = self._session.post(self.url(Endpoints.update_namespace_properties, namespace=namespace), json=payload)
+        response = self._session.post(
+            self.url(Endpoints.update_namespace_properties, namespace=namespace),
+            json=payload,
+            headers=self._mutation_headers(),
+        )
         try:
             response.raise_for_status()
         except HTTPError as exc:
@@ -1838,6 +2060,7 @@ class RestCatalog(Catalog):
         response = self._session.post(
             self.url(Endpoints.register_view, namespace=namespace_and_view["namespace"]),
             data=serialized_json,
+            headers=self._mutation_headers(),
         )
         try:
             response.raise_for_status()
@@ -1853,6 +2076,7 @@ class RestCatalog(Catalog):
         self._check_endpoint(Capability.V1_DELETE_VIEW)
         response = self._session.delete(
             self.url(Endpoints.drop_view, prefixed=True, **self._split_identifier_for_path(identifier, IdentifierKind.VIEW)),
+            headers=self._mutation_headers(),
         )
         try:
             response.raise_for_status()
@@ -1876,7 +2100,7 @@ class RestCatalog(Catalog):
             raise NoSuchNamespaceError(f"Destination namespace does not exist: {destination_namespace}")
 
         payload = {"source": source, "destination": destination}
-        response = self._session.post(self.url(Endpoints.rename_view), json=payload)
+        response = self._session.post(self.url(Endpoints.rename_view), json=payload, headers=self._mutation_headers())
         try:
             response.raise_for_status()
         except HTTPError as exc:
